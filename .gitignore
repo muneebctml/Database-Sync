@@ -1,0 +1,59 @@
+# Build results
+bin/
+obj/
+out/
+**/bin/
+**/obj/
+
+# VS local settings
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+
+# Logs
+*.log
+logs/
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+**/packages/*
+!**/packages/build/
+!**/packages/repositories.config
+
+# Azure / publish
+PublishProfiles/
+*.pubxml
+*.pubxml.user
+
+# Resharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+
+# Coverage
+*.coverage
+*.coveragexml
+TestResults/
+
+# Generated files
+*.g.cs
+*.g.i.cs
+Generated_Code/
+
+# Local tooling
+.vscode/
+.ionide/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
