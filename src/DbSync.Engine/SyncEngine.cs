@@ -97,7 +97,7 @@ public sealed class DatabaseSyncEngine : ISyncEngine
 
                 if (batch.Count >= batchSize)
                 {
-                    await targetSession.DataWriter.InsertBatchAsync(targetTable, batch, cancellationToken).ConfigureAwait(false);
+                    await WriteBatchAsync(targetSession, targetTable, batch, options.Mode, cancellationToken).ConfigureAwait(false);
                     rowsSyncedForTable += batch.Count;
                     batch.Clear();
 
@@ -114,7 +114,7 @@ public sealed class DatabaseSyncEngine : ISyncEngine
 
             if (batch.Count > 0)
             {
-                await targetSession.DataWriter.InsertBatchAsync(targetTable, batch, cancellationToken).ConfigureAwait(false);
+                await WriteBatchAsync(targetSession, targetTable, batch, options.Mode, cancellationToken).ConfigureAwait(false);
                 rowsSyncedForTable += batch.Count;
             }
 
@@ -129,6 +129,21 @@ public sealed class DatabaseSyncEngine : ISyncEngine
                 TotalTables = totalTables
             });
         }
+    }
+
+    private static Task WriteBatchAsync(
+        IDbSession targetSession,
+        TableSchema targetTable,
+        IReadOnlyList<RowData> batch,
+        SyncMode mode,
+        CancellationToken cancellationToken)
+    {
+        if (mode == SyncMode.Append && targetSession.Capabilities.SupportsUpsert)
+        {
+            return targetSession.DataWriter.UpsertBatchAsync(targetTable, batch, cancellationToken);
+        }
+
+        return targetSession.DataWriter.InsertBatchAsync(targetTable, batch, cancellationToken);
     }
 }
 

@@ -78,7 +78,8 @@ public sealed class ColumnSchema
         bool isNullable,
         int? length = null,
         int? precision = null,
-        int? scale = null)
+        int? scale = null,
+        bool isIdentity = false)
     {
         Name = name ?? throw new ArgumentNullException(nameof(name));
         Type = type;
@@ -87,6 +88,7 @@ public sealed class ColumnSchema
         Length = length;
         Precision = precision;
         Scale = scale;
+        IsIdentity = isIdentity;
     }
 
     public string Name { get; }
@@ -102,6 +104,8 @@ public sealed class ColumnSchema
     public int? Precision { get; }
 
     public int? Scale { get; }
+
+    public bool IsIdentity { get; }
 }
 
 public sealed class PrimaryKeySchema
@@ -116,4 +120,3 @@ public sealed class PrimaryKeySchema
 
     public IReadOnlyList<string> Columns { get; }
 }
-

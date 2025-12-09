@@ -4,10 +4,12 @@ obj/
 out/
 **/bin/
 **/obj/
+artifacts/
 
 # VS local settings
 .vs/
 *.user
+*.rsuser
 *.suo
 *.userosscache
 *.sln.docstates
@@ -19,6 +21,13 @@ out/
 # Logs
 *.log
 logs/
+
+# Build artefacts / caches
+*.cache
+*.ide
+*.pidb
+*.svclog
+*.userprefs
 
 # NuGet
 *.nupkg
@@ -41,6 +50,7 @@ _ReSharper*/
 *.coverage
 *.coveragexml
 TestResults/
+TestResult.xml
 
 # Generated files
 *.g.cs
@@ -56,4 +66,3 @@ Generated_Code/
 # OS junk
 .DS_Store
 Thumbs.db
-

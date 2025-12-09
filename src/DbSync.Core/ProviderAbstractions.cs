@@ -75,6 +75,8 @@ public interface IDataWriter
 
     Task InsertBatchAsync(TableSchema table, IReadOnlyList<RowData> rows, CancellationToken cancellationToken = default);
 
+    Task UpsertBatchAsync(TableSchema table, IReadOnlyList<RowData> rows, CancellationToken cancellationToken = default);
+
     Task ExecuteCommandAsync(string sql, CancellationToken cancellationToken = default);
 }
 
@@ -105,4 +107,3 @@ public sealed class RowData
         return Values.TryGetValue(columnName, out var value) ? value : null;
     }
 }
-

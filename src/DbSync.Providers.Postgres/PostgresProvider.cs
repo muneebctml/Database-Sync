@@ -127,7 +127,7 @@ internal sealed class PostgresCapabilities : ICapabilities
 
     public bool SupportsBulkInsert => true;
 
-    public bool SupportsUpsert => false;
+    public bool SupportsUpsert => true;
 }
 
 internal sealed class PostgresIntrospector : IIntrospector
@@ -151,7 +151,8 @@ SELECT table_schema,
        data_type,
        character_maximum_length,
        numeric_precision,
-       numeric_scale
+       numeric_scale,
+       is_identity
 FROM information_schema.columns
 WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
 ORDER BY table_schema, table_name, ordinal_position;";
@@ -170,6 +171,7 @@ ORDER BY table_schema, table_name, ordinal_position;";
                 int? length = reader.IsDBNull(5) ? null : reader.GetInt32(5);
                 int? precision = reader.IsDBNull(6) ? null : Convert.ToInt32(reader.GetValue(6));
                 int? scale = reader.IsDBNull(7) ? null : Convert.ToInt32(reader.GetValue(7));
+                var isIdentityString = reader.IsDBNull(8) ? null : reader.GetString(8);
 
                 var key = (schema, table);
                 if (!tables.TryGetValue(key, out var columnList))
@@ -180,8 +182,9 @@ ORDER BY table_schema, table_name, ordinal_position;";
 
                 var canonicalType = PostgresTypeMapper.MapToCanonical(dataType);
                 var isNullable = string.Equals(isNullableString, "YES", StringComparison.OrdinalIgnoreCase);
+                var isIdentity = string.Equals(isIdentityString, "YES", StringComparison.OrdinalIgnoreCase);
 
-                columnList.Add(new ColumnSchema(columnName, canonicalType, dataType, isNullable, length, precision, scale));
+                columnList.Add(new ColumnSchema(columnName, canonicalType, dataType, isNullable, length, precision, scale, isIdentity));
             }
         }
 
@@ -474,11 +477,184 @@ internal sealed class PostgresDataWriter : IDataWriter
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task UpsertBatchAsync(TableSchema table, IReadOnlyList<RowData> rows, CancellationToken cancellationToken = default)
+    {
+        if (table is null) throw new ArgumentNullException(nameof(table));
+        if (rows is null) throw new ArgumentNullException(nameof(rows));
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        var keyColumns = GetKeyColumns(table, out var useFullRowMatch);
+
+        foreach (var row in rows)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (useFullRowMatch)
+            {
+                var exists = await RowExistsByAllColumnsAsync(table, row, cancellationToken).ConfigureAwait(false);
+                if (!exists)
+                {
+                    await InsertBatchAsync(table, new[] { row }, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                var exists = await RowExistsByKeyAsync(table, keyColumns, row, cancellationToken).ConfigureAwait(false);
+                if (exists)
+                {
+                    await UpdateByKeyAsync(table, keyColumns, row, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await InsertBatchAsync(table, new[] { row }, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+    }
+
     public async Task ExecuteCommandAsync(string sql, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(sql)) throw new ArgumentException("SQL must not be empty.", nameof(sql));
 
         await using var command = new NpgsqlCommand(sql, _connection);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static IReadOnlyList<ColumnSchema> GetKeyColumns(TableSchema table, out bool useFullRowMatch)
+    {
+        useFullRowMatch = false;
+
+        if (table.PrimaryKey is { Columns.Count: > 0 })
+        {
+            var pkSet = new HashSet<string>(table.PrimaryKey.Columns, StringComparer.OrdinalIgnoreCase);
+            return table.Columns.Where(c => pkSet.Contains(c.Name)).ToArray();
+        }
+
+        var identityColumn = table.Columns.FirstOrDefault(c => c.IsIdentity);
+        if (identityColumn is not null)
+        {
+            return new[] { identityColumn };
+        }
+
+        useFullRowMatch = true;
+        return Array.Empty<ColumnSchema>();
+    }
+
+    private async Task<bool> RowExistsByKeyAsync(
+        TableSchema table,
+        IReadOnlyList<ColumnSchema> keyColumns,
+        RowData row,
+        CancellationToken cancellationToken)
+    {
+        var whereParts = new List<string>();
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            whereParts.Add($"{PostgresTypeMapper.QuoteIdentifier(keyColumns[i].Name)} = @k{i}");
+        }
+
+        var whereClause = string.Join(" AND ", whereParts);
+        var sql = $"SELECT 1 FROM {PostgresTypeMapper.QuoteIdentifier(table.SchemaName)}.{PostgresTypeMapper.QuoteIdentifier(table.TableName)} WHERE {whereClause}";
+
+        await using var command = new NpgsqlCommand(sql, _connection);
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            var columnName = keyColumns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"k{i}", value);
+        }
+
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result is not null;
+    }
+
+    private async Task UpdateByKeyAsync(
+        TableSchema table,
+        IReadOnlyList<ColumnSchema> keyColumns,
+        RowData row,
+        CancellationToken cancellationToken)
+    {
+        var nonKeyColumns = table.Columns
+            .Where(c => !keyColumns.Any(k => string.Equals(k.Name, c.Name, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+
+        if (nonKeyColumns.Length == 0)
+        {
+            return;
+        }
+
+        var setParts = new List<string>();
+        for (var i = 0; i < nonKeyColumns.Length; i++)
+        {
+            setParts.Add($"{PostgresTypeMapper.QuoteIdentifier(nonKeyColumns[i].Name)} = @p{i}");
+        }
+
+        var whereParts = new List<string>();
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            whereParts.Add($"{PostgresTypeMapper.QuoteIdentifier(keyColumns[i].Name)} = @k{i}");
+        }
+
+        var sqlBuilder = new StringBuilder();
+        sqlBuilder.Append("UPDATE ");
+        sqlBuilder.Append(PostgresTypeMapper.QuoteIdentifier(table.SchemaName));
+        sqlBuilder.Append('.');
+        sqlBuilder.Append(PostgresTypeMapper.QuoteIdentifier(table.TableName));
+        sqlBuilder.Append(" SET ");
+        sqlBuilder.Append(string.Join(", ", setParts));
+        sqlBuilder.Append(" WHERE ");
+        sqlBuilder.Append(string.Join(" AND ", whereParts));
+
+        await using var command = new NpgsqlCommand(sqlBuilder.ToString(), _connection);
+
+        for (var i = 0; i < nonKeyColumns.Length; i++)
+        {
+            var columnName = nonKeyColumns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"p{i}", value);
+        }
+
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            var columnName = keyColumns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"k{i}", value);
+        }
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<bool> RowExistsByAllColumnsAsync(
+        TableSchema table,
+        RowData row,
+        CancellationToken cancellationToken)
+    {
+        var conditions = new List<string>();
+
+        for (var i = 0; i < table.Columns.Count; i++)
+        {
+            var column = table.Columns[i];
+            var parameterName = $"p{i}";
+            var quoted = PostgresTypeMapper.QuoteIdentifier(column.Name);
+
+            conditions.Add($"((@{parameterName} IS NULL AND {quoted} IS NULL) OR {quoted} = @{parameterName})");
+        }
+
+        var whereClause = string.Join(" AND ", conditions);
+        var sql = $"SELECT 1 FROM {PostgresTypeMapper.QuoteIdentifier(table.SchemaName)}.{PostgresTypeMapper.QuoteIdentifier(table.TableName)} WHERE {whereClause}";
+
+        await using var command = new NpgsqlCommand(sql, _connection);
+
+        for (var i = 0; i < table.Columns.Count; i++)
+        {
+            var columnName = table.Columns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"p{i}", value);
+        }
+
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result is not null;
     }
 }

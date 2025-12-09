@@ -136,7 +136,7 @@ internal sealed class SqlServerCapabilities : ICapabilities
 
     public bool SupportsBulkInsert => true;
 
-    public bool SupportsUpsert => false;
+    public bool SupportsUpsert => true;
 }
 
 internal sealed class SqlServerIntrospector : IIntrospector
@@ -160,7 +160,8 @@ SELECT c.TABLE_SCHEMA,
        c.DATA_TYPE,
        c.CHARACTER_MAXIMUM_LENGTH,
        c.NUMERIC_PRECISION,
-       c.NUMERIC_SCALE
+       c.NUMERIC_SCALE,
+       COLUMNPROPERTY(object_id(QUOTENAME(c.TABLE_SCHEMA)+'.'+QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY
 FROM INFORMATION_SCHEMA.COLUMNS c
 JOIN INFORMATION_SCHEMA.TABLES t
   ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
@@ -182,6 +183,7 @@ ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION;";
                 int? length = reader.IsDBNull(5) ? null : reader.GetInt32(5);
                 int? precision = reader.IsDBNull(6) ? null : Convert.ToInt32(reader.GetValue(6));
                 int? scale = reader.IsDBNull(7) ? null : Convert.ToInt32(reader.GetValue(7));
+                var isIdentity = !reader.IsDBNull(8) && Convert.ToInt32(reader.GetValue(8)) == 1;
 
                 var key = (schema, table);
                 if (!tables.TryGetValue(key, out var columnList))
@@ -193,7 +195,7 @@ ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION;";
                 var canonicalType = SqlServerTypeMapper.MapToCanonical(dataType);
                 var isNullable = string.Equals(isNullableString, "YES", StringComparison.OrdinalIgnoreCase);
 
-                columnList.Add(new ColumnSchema(columnName, canonicalType, dataType, isNullable, length, precision, scale));
+                columnList.Add(new ColumnSchema(columnName, canonicalType, dataType, isNullable, length, precision, scale, isIdentity));
             }
         }
 
@@ -478,6 +480,45 @@ internal sealed class SqlServerDataWriter : IDataWriter
         await bulkCopy.WriteToServerAsync(dataTable, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task UpsertBatchAsync(TableSchema table, IReadOnlyList<RowData> rows, CancellationToken cancellationToken = default)
+    {
+        if (table is null) throw new ArgumentNullException(nameof(table));
+        if (rows is null) throw new ArgumentNullException(nameof(rows));
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        var keyColumns = GetKeyColumns(table, out var useFullRowMatch);
+
+        foreach (var row in rows)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (useFullRowMatch)
+            {
+                // No key or identity: match on all columns; if identical row exists, skip, otherwise insert.
+                var exists = await RowExistsByAllColumnsAsync(table, row, cancellationToken).ConfigureAwait(false);
+                if (!exists)
+                {
+                    await InsertBatchAsync(table, new[] { row }, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                var exists = await RowExistsByKeyAsync(table, keyColumns, row, cancellationToken).ConfigureAwait(false);
+                if (exists)
+                {
+                    await UpdateByKeyAsync(table, keyColumns, row, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await InsertBatchAsync(table, new[] { row }, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+    }
+
     public async Task ExecuteCommandAsync(string sql, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(sql)) throw new ArgumentException("SQL must not be empty.", nameof(sql));
@@ -489,5 +530,142 @@ internal sealed class SqlServerDataWriter : IDataWriter
     private static string QuoteIdentifier(string identifier)
     {
         return $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
+    }
+
+    private static IReadOnlyList<ColumnSchema> GetKeyColumns(TableSchema table, out bool useFullRowMatch)
+    {
+        useFullRowMatch = false;
+
+        if (table.PrimaryKey is { Columns.Count: > 0 })
+        {
+            var pkSet = new HashSet<string>(table.PrimaryKey.Columns, StringComparer.OrdinalIgnoreCase);
+            return table.Columns.Where(c => pkSet.Contains(c.Name)).ToArray();
+        }
+
+        var identityColumn = table.Columns.FirstOrDefault(c => c.IsIdentity);
+        if (identityColumn is not null)
+        {
+            return new[] { identityColumn };
+        }
+
+        // Fallback: no key, no identity -> use all columns as "match" key.
+        useFullRowMatch = true;
+        return Array.Empty<ColumnSchema>();
+    }
+
+    private async Task<bool> RowExistsByKeyAsync(
+        TableSchema table,
+        IReadOnlyList<ColumnSchema> keyColumns,
+        RowData row,
+        CancellationToken cancellationToken)
+    {
+        var whereParts = new List<string>();
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            whereParts.Add($"{QuoteIdentifier(keyColumns[i].Name)} = @k{i}");
+        }
+
+        var whereClause = string.Join(" AND ", whereParts);
+        var sql = $"SELECT 1 FROM {QuoteIdentifier(table.SchemaName)}.{QuoteIdentifier(table.TableName)} WHERE {whereClause}";
+
+        await using var command = new SqlCommand(sql, _connection);
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            var columnName = keyColumns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"k{i}", value);
+        }
+
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result is not null;
+    }
+
+    private async Task UpdateByKeyAsync(
+        TableSchema table,
+        IReadOnlyList<ColumnSchema> keyColumns,
+        RowData row,
+        CancellationToken cancellationToken)
+    {
+        var nonKeyColumns = table.Columns
+            .Where(c => !keyColumns.Any(k => string.Equals(k.Name, c.Name, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+
+        if (nonKeyColumns.Length == 0)
+        {
+            return;
+        }
+
+        var setParts = new List<string>();
+        for (var i = 0; i < nonKeyColumns.Length; i++)
+        {
+            setParts.Add($"{QuoteIdentifier(nonKeyColumns[i].Name)} = @p{i}");
+        }
+
+        var whereParts = new List<string>();
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            whereParts.Add($"{QuoteIdentifier(keyColumns[i].Name)} = @k{i}");
+        }
+
+        var sql = new StringBuilder();
+        sql.Append("UPDATE ");
+        sql.Append(QuoteIdentifier(table.SchemaName));
+        sql.Append('.');
+        sql.Append(QuoteIdentifier(table.TableName));
+        sql.Append(" SET ");
+        sql.Append(string.Join(", ", setParts));
+        sql.Append(" WHERE ");
+        sql.Append(string.Join(" AND ", whereParts));
+
+        await using var command = new SqlCommand(sql.ToString(), _connection);
+
+        for (var i = 0; i < nonKeyColumns.Length; i++)
+        {
+            var columnName = nonKeyColumns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"p{i}", value);
+        }
+
+        for (var i = 0; i < keyColumns.Count; i++)
+        {
+            var columnName = keyColumns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"k{i}", value);
+        }
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<bool> RowExistsByAllColumnsAsync(
+        TableSchema table,
+        RowData row,
+        CancellationToken cancellationToken)
+    {
+        var conditions = new List<string>();
+
+        for (var i = 0; i < table.Columns.Count; i++)
+        {
+            var column = table.Columns[i];
+            var parameterName = $"p{i}";
+            var quoted = QuoteIdentifier(column.Name);
+
+            // Handle NULL equality
+            conditions.Add($"((@{parameterName} IS NULL AND {quoted} IS NULL) OR {quoted} = @{parameterName})");
+        }
+
+        var whereClause = string.Join(" AND ", conditions);
+        var sql = $"SELECT 1 FROM {QuoteIdentifier(table.SchemaName)}.{QuoteIdentifier(table.TableName)} WHERE {whereClause}";
+
+        await using var command = new SqlCommand(sql, _connection);
+
+        for (var i = 0; i < table.Columns.Count; i++)
+        {
+            var columnName = table.Columns[i].Name;
+            var value = row.GetValue(columnName) ?? DBNull.Value;
+            command.Parameters.AddWithValue($"p{i}", value);
+        }
+
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result is not null;
     }
 }
